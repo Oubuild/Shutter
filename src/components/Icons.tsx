@@ -92,6 +92,16 @@ export function IconCheck(props: IconProps) {
   );
 }
 
+/** Select mode: a check-square, the usual "choose several" affordance. */
+export function IconSelect(props: IconProps) {
+  return (
+    <Glyph {...props}>
+      <rect x="3.5" y="3.5" width="17" height="17" rx="4" />
+      <path d="M8.2 12.2l2.7 2.7 5-5.4" />
+    </Glyph>
+  );
+}
+
 export function IconAlert(props: IconProps) {
   return (
     <Glyph {...props}>

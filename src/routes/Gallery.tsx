@@ -4,6 +4,12 @@
  * The listing comes from Rust, which is the only place that knows the save
  * directory and the file-name contract. Thumbnails are fetched lazily per item
  * as a data URL; the backend caches them on disk, so a refresh is cheap.
+ *
+ * The grid is a fixed three-up (`gallery-grid` in `uno.config.ts`). The main
+ * window is a non-resizable 400×740 strip (see `windows::open_main`), so the
+ * old `auto-fill`/`minmax(168px,1fr)` template could only ever fit two columns
+ * on its 360px content width; three 168px tracks would have needed 524px.
+ * Cards now land at (360 − 2×10) / 3 ≈ 113px wide.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -11,7 +17,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, errorText, type GalleryItem } from "../lib/ipc";
 import { Preview } from "../components/Preview";
 import { Confirm } from "../components/Confirm";
-import { IconFolder, IconImage, IconRefresh } from "../components/Icons";
+import { IconCheck, IconFolder, IconImage, IconRefresh, IconSelect, IconTrash } from "../components/Icons";
 import { formatAccelerator } from "../lib/shortcut";
 
 type Props = {
@@ -66,6 +72,13 @@ export function Gallery({ reloadKey = 0, active = true }: Props) {
   const [menu, setMenu] = useState<{ item: GalleryItem; x: number; y: number } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [captureAccel, setCaptureAccel] = useState<string | null>(null);
+
+  // Select mode (batch delete). While it is on, clicking a card toggles it
+  // instead of opening the preview, and the header swaps to the selection
+  // actions. Selection is keyed by path, which is unique per file.
+  const [selecting, setSelecting] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [pendingBatchDelete, setPendingBatchDelete] = useState(false);
 
   // Thumbnails are fetched one by one; this ref prevents a second request for
   // an item that is already in flight during a re-render.
@@ -160,6 +173,21 @@ export function Gallery({ reloadKey = 0, active = true }: Props) {
     };
   }, [menu]);
 
+  // Escape leaves select mode — but only when no dialog is on top of it, or
+  // the dialog's own Escape handler would also exit the mode behind it.
+  useEffect(() => {
+    if (!selecting || pendingBatchDelete || pendingDelete) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setSelecting(false);
+        setSelected(new Set());
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selecting, pendingBatchDelete, pendingDelete]);
+
   const groups = useMemo(() => {
     if (!items) return [];
     const byDay = new Map<string, GalleryItem[]>();
@@ -213,6 +241,84 @@ export function Gallery({ reloadKey = 0, active = true }: Props) {
     }
   }, [pendingDelete, preview]);
 
+  /* ------------------------------------------------------------ select mode */
+
+  const exitSelect = useCallback(() => {
+    setSelecting(false);
+    setSelected(new Set());
+    setPendingBatchDelete(false);
+  }, []);
+
+  const toggleSelected = useCallback((path: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+
+  // The window reloads the list on focus (a capture finishing, a settings
+  // window closing), which can remove files from under a live selection —
+  // e.g. deleted in Finder mid-selection. Prune those paths so the header
+  // count and the delete batch never include something already gone.
+  useEffect(() => {
+    if (!items) return;
+    setSelected((prev) => {
+      if (prev.size === 0) return prev;
+      const alive = new Set(items.map((i) => i.path));
+      const next = new Set([...prev].filter((path) => alive.has(path)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [items]);
+
+  const allSelected = items !== null && items.length > 0 && selected.size === items.length;
+
+  const toggleSelectAll = useCallback(() => {
+    if (!items) return;
+    // "All" means the whole gallery, not the day group: the header counter
+    // reads "已选 N 张" against the total, so both must agree.
+    setSelected(allSelected ? new Set() : new Set(items.map((i) => i.path)));
+  }, [items, allSelected]);
+
+  const confirmBatchDelete = useCallback(async () => {
+    const paths = Array.from(selected);
+    setPendingBatchDelete(false);
+    if (paths.length === 0) return;
+    try {
+      const failures = await api.deleteGalleryItems(paths);
+      const failedSet = new Set(failures.map((f) => f.path));
+      const removed = paths.filter((p) => !failedSet.has(p));
+
+      // Drop only what actually left the disk; a failed file stays visible so
+      // the user can retry it or see why it is stuck.
+      setItems((prev) => (prev ? prev.filter((i) => !removed.includes(i.path)) : prev));
+      setThumbs((prev) => {
+        const next = { ...prev };
+        for (const path of removed) delete next[path];
+        return next;
+      });
+      if (preview && removed.includes(preview.path)) setPreview(null);
+
+      if (failures.length === 0) {
+        setToast(`已删除 ${removed.length} 张`);
+        exitSelect();
+        return;
+      }
+
+      const reason = failures[0].reason;
+      setToast(
+        removed.length === 0
+          ? `删除失败：${reason}`
+          : `已删除 ${removed.length} 张，${failures.length} 张失败：${reason}`,
+      );
+      // Keep the failed ones selected so a retry is one click away.
+      setSelected(failedSet);
+    } catch (e) {
+      setToast(`删除失败：${errorText(e)}`);
+    }
+  }, [selected, preview, exitSelect]);
+
   const copyItem = useCallback(async (item: GalleryItem) => {
     try {
       // Read the original file, not the thumbnail: pasting a 480px preview
@@ -254,39 +360,84 @@ export function Gallery({ reloadKey = 0, active = true }: Props) {
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <header className="flex flex-none items-end justify-between gap-4 px-5 pb-3.5 pt-4.5">
-        <div className="flex items-baseline gap-2.5">
-          <h1 className="m-0 text-[17px] font-600 color-base">图库</h1>
-          <span className="text-mini color-faint">
-            {items === null
-              ? "加载中…"
-              : items.length === 0
-                ? "还没有截图"
-                : `${items.length} 张截图`}
-          </span>
-        </div>
-        <div className="flex gap-1">
-          <button
-            type="button"
-            title={busy ? "正在刷新…" : "刷新"}
-            aria-label="刷新"
-            className="inline-flex h-8 w-8 items-center justify-center rounded-lg color-muted transition-colors duration-100 outline-none hover:bg-hover hover:color-base disabled:pointer-events-none disabled:op-40 focus-visible:ring-2 focus-visible:ring-primary-500/40"
-            onClick={() => void refresh()}
-            disabled={busy}
-          >
-            <IconRefresh size={16} className={busy ? "animate-spin" : undefined} />
-          </button>
-          <button
-            type="button"
-            title="打开文件夹"
-            aria-label="打开文件夹"
-            className="inline-flex h-8 w-8 items-center justify-center rounded-lg color-muted transition-colors duration-100 outline-none hover:bg-hover hover:color-base disabled:pointer-events-none disabled:op-40 focus-visible:ring-2 focus-visible:ring-primary-500/40"
-            onClick={() => void openFolder()}
-            disabled={!dir}
-          >
-            <IconFolder size={16} />
-          </button>
-        </div>
+      <header className="flex flex-none items-center justify-between gap-4 px-5 pb-3.5 pt-4.5">
+        {selecting ? (
+          <>
+            <h1 className="m-0 text-[17px] font-600 color-base">已选 {selected.size} 张</h1>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                className="inline-flex h-7 items-center rounded-md px-2 text-mini font-500 color-muted transition-colors duration-100 outline-none hover:bg-hover hover:color-base focus-visible:ring-2 focus-visible:ring-primary-500/40"
+                onClick={toggleSelectAll}
+              >
+                {allSelected ? "取消全选" : "全选"}
+              </button>
+              <button
+                type="button"
+                title={selected.size === 0 ? "请先选择截图" : "删除所选截图"}
+                aria-label="删除所选截图"
+                className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-mini font-500 text-error-600 transition-colors duration-100 outline-none hover:bg-error-500/10 disabled:pointer-events-none disabled:op-40 focus-visible:ring-2 focus-visible:ring-primary-500/40 dark:text-error-400"
+                onClick={() => setPendingBatchDelete(true)}
+                disabled={selected.size === 0 || busy}
+              >
+                <IconTrash size={13} />
+                删除
+              </button>
+              <button
+                type="button"
+                className="inline-flex h-7 items-center rounded-md px-2 text-mini font-600 color-base transition-colors duration-100 outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-primary-500/40"
+                onClick={exitSelect}
+              >
+                完成
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="flex items-baseline gap-2.5">
+              <h1 className="m-0 text-[17px] font-600 color-base">图库</h1>
+              <span className="text-mini color-faint">
+                {items === null
+                  ? "加载中…"
+                  : items.length === 0
+                    ? "还没有截图"
+                    : `${items.length} 张截图`}
+              </span>
+            </div>
+            <div className="flex gap-1">
+              <button
+                type="button"
+                title="批量选择"
+                aria-label="批量选择"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-lg color-muted transition-colors duration-100 outline-none hover:bg-hover hover:color-base disabled:pointer-events-none disabled:op-40 focus-visible:ring-2 focus-visible:ring-primary-500/40"
+                onClick={() => setSelecting(true)}
+                disabled={items === null || items.length === 0}
+              >
+                <IconSelect size={16} />
+              </button>
+              <button
+                type="button"
+                title={busy ? "正在刷新…" : "刷新"}
+                aria-label="刷新"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-lg color-muted transition-colors duration-100 outline-none hover:bg-hover hover:color-base disabled:pointer-events-none disabled:op-40 focus-visible:ring-2 focus-visible:ring-primary-500/40"
+                onClick={() => void refresh()}
+                disabled={busy}
+              >
+                <IconRefresh size={16} className={busy ? "animate-spin" : undefined} />
+              </button>
+              <button
+                type="button"
+                title="打开文件夹"
+                aria-label="打开文件夹"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-lg color-muted transition-colors duration-100 outline-none hover:bg-hover hover:color-base disabled:pointer-events-none disabled:op-40 focus-visible:ring-2 focus-visible:ring-primary-500/40"
+                onClick={() => void openFolder()}
+                disabled={!dir}
+              >
+                <IconFolder size={16} />
+              </button>
+            </div>
+          </>
+        )}
       </header>
 
       {error && (
@@ -298,7 +449,7 @@ export function Gallery({ reloadKey = 0, active = true }: Props) {
       <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-5 pb-4">
         {items === null && !error && (
           /* First-load skeleton: one shimmer row per expected grid line. */
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(168px,1fr))] gap-2.5">
+          <div className="gallery-grid">
             {Array.from({ length: 6 }).map((_, i) => (
               <div key={i} className="thumb-shimmer aspect-[4/3] rounded-lg border border-base" />
             ))}
@@ -328,31 +479,71 @@ export function Gallery({ reloadKey = 0, active = true }: Props) {
               <span className="text-mini font-600 color-faint">{dayLabel(group[0].createdAt)}</span>
               <span className="text-micro color-faint op-70">{group.length} 张</span>
             </div>
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(168px,1fr))] gap-2.5">
-              {group.map((item) => (
-                <button
-                  key={item.path}
-                  type="button"
-                  className="group relative block aspect-[4/3] overflow-hidden rounded-lg border border-base bg-base p-0 text-left shadow-none transition duration-150 hover:border-primary-500 hover:shadow-md"
-                  title={`${item.name}\n${item.width}×${item.height} · ${sizeLabel(item.bytes)}`}
-                  onClick={() => setPreview(item)}
-                  onContextMenu={(e) => openMenu(e, item)}
-                >
-                  {thumbs[item.path] ? (
-                    <img
-                      className="block h-full w-full object-cover"
-                      src={thumbs[item.path]}
-                      alt=""
-                      draggable={false}
-                    />
-                  ) : (
-                    <div className="thumb-shimmer h-full w-full" />
-                  )}
-                  <span className="absolute bottom-1.5 right-1.5 rounded-md bg-black/60 px-1.5 py-px text-micro tabular-nums text-white op-0 transition duration-150 group-hover:op-100">
-                    {timeLabel(item.createdAt)}
-                  </span>
-                </button>
-              ))}
+            <div className="gallery-grid">
+              {group.map((item) => {
+                const checked = selecting && selected.has(item.path);
+                return (
+                  <button
+                    key={item.path}
+                    type="button"
+                    // In select mode the card is a checkbox, so the thumbnail
+                    // must not open the preview on the same click.
+                    role={selecting ? "checkbox" : undefined}
+                    aria-checked={selecting ? checked : undefined}
+                    aria-label={selecting ? (checked ? "取消选择" : "选择") : undefined}
+                    className={`group relative block aspect-[4/3] overflow-hidden rounded-lg border bg-base p-0 text-left shadow-none transition duration-150 hover:shadow-md ${
+                      // `primary` here is near-black, so the selected ring needs
+                      // the dark-theme flip the action buttons already use —
+                      // otherwise it vanishes against the dark page.
+                      checked
+                        ? "border-primary-500 ring-2 ring-primary-500/35 dark:border-neutral-200 dark:ring-neutral-200/35"
+                        : "border-base hover:border-primary-500 dark:hover:border-neutral-400"
+                    }`}
+                    title={`${item.name}\n${item.width}×${item.height} · ${sizeLabel(item.bytes)}`}
+                    onClick={() => (selecting ? toggleSelected(item.path) : setPreview(item))}
+                    onContextMenu={(e) => {
+                      // The context menu is the single-item path; in select mode
+                      // suppress it so a right-click cannot start a second,
+                      // conflicting delete flow.
+                      if (selecting) {
+                        e.preventDefault();
+                        return;
+                      }
+                      openMenu(e, item);
+                    }}
+                  >
+                    {thumbs[item.path] ? (
+                      <img
+                        className="block h-full w-full object-cover"
+                        src={thumbs[item.path]}
+                        alt=""
+                        draggable={false}
+                      />
+                    ) : (
+                      <div className="thumb-shimmer h-full w-full" />
+                    )}
+                    {/* Dim the unselected ones so the selection reads at a
+                        glance across a dense three-up row. */}
+                    {selecting && !checked && (
+                      <span className="pointer-events-none absolute inset-0 bg-black/25" />
+                    )}
+                    {selecting && (
+                      <span
+                        className={`pointer-events-none absolute left-1.5 top-1.5 grid h-4.5 w-4.5 place-items-center rounded-full border transition duration-150 ${
+                          checked
+                            ? "border-primary-500 bg-primary-500 text-white dark:border-neutral-200 dark:bg-neutral-200 dark:text-neutral-900"
+                            : "border-white/80 bg-black/35"
+                        }`}
+                      >
+                        {checked && <IconCheck size={10} />}
+                      </span>
+                    )}
+                    <span className="absolute bottom-1.5 right-1.5 rounded-md bg-black/60 px-1.5 py-px text-micro tabular-nums text-white op-0 transition duration-150 group-hover:op-100">
+                      {timeLabel(item.createdAt)}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
           </section>
         ))}
@@ -424,6 +615,20 @@ export function Gallery({ reloadKey = 0, active = true }: Props) {
           confirmLabel="删除"
           onCancel={() => setPendingDelete(null)}
           onConfirm={() => void confirmDelete()}
+        />
+      )}
+
+      {pendingBatchDelete && (
+        <Confirm
+          title={`删除 ${selected.size} 张截图`}
+          message={
+            selected.size === 1
+              ? "确定要删除所选截图吗？此操作不可撤销。"
+              : `确定要删除这 ${selected.size} 张截图吗？此操作不可撤销。`
+          }
+          confirmLabel="删除"
+          onCancel={() => setPendingBatchDelete(false)}
+          onConfirm={() => void confirmBatchDelete()}
         />
       )}
     </div>

@@ -263,6 +263,17 @@ pub struct GalleryItem {
     pub created_at: i64,
 }
 
+/// One entry of a partially-failed batch delete.
+///
+/// `path` is echoed back exactly as the caller sent it, so the UI can match it
+/// against its own list without assuming how Rust resolved it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteFailure {
+    pub path: String,
+    pub reason: String,
+}
+
 /// An on-screen window, for the overlay's hover-to-select.
 ///
 /// Coordinates follow the [`MonitorInfo`] contract: **logical points** in the

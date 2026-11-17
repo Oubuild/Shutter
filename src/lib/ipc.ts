@@ -181,6 +181,13 @@ export type GalleryItem = {
   createdAt: number;
 };
 
+/** One entry of a partly-failed batch delete (`delete_gallery_items`). */
+export type DeleteFailure = {
+  /** Echoed back exactly as sent, so the UI can match its own list. */
+  path: string;
+  reason: string;
+};
+
 /* -------------------------------------------------------- long screenshot */
 
 /** Payload of `open_scroll_screenshot_event` (reference `scrollScreen` chunk).
@@ -297,6 +304,13 @@ export const api = {
     invoke<string>("gallery_full_image", { path }),
   deleteGalleryItem: (path: string) =>
     invoke<void>("delete_gallery_item", { path }),
+  /**
+   * Batch delete for the gallery's select mode. Resolves to the entries that
+   * could not be removed (empty array = all gone); it only rejects when the
+   * whole call fails, e.g. the save directory is unreadable.
+   */
+  deleteGalleryItems: (paths: string[]) =>
+    invoke<DeleteFailure[]>("delete_gallery_items", { paths }),
   saveDirectory: () => invoke<string>("save_directory"),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   openDirectory: (path: string) => invoke<void>("open_directory", { path }),

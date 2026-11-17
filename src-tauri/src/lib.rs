@@ -368,6 +368,7 @@ pub fn run() {
             commands::gallery_thumbnail,
             commands::gallery_full_image,
             commands::delete_gallery_item,
+            commands::delete_gallery_items,
             commands::save_directory,
             commands::reveal_path,
             commands::open_directory,

@@ -153,6 +153,12 @@ input, textarea, select { font: inherit; color: inherit; }
       'w-full h-8 rounded-md border border-neutral-300 dark:border-neutral-700 bg-base px-2.5 py-0 text-compact color-base outline-none transition shadow-[inset_0_1px_1.5px_rgba(0,0,0,0.04)] hover:border-neutral-400 dark:hover:border-neutral-600 focus:border-primary-500 focus:shadow-none focus:ring-2 focus:ring-primary-500/20 placeholder:color-faint',
     "app-hint": "m-0 text-mini color-faint leading-relaxed",
     "app-meta": "font-mono tabular-nums text-mini color-faint truncate",
+
+    // Gallery: always three thumbnails per row. The main window is a fixed
+    // 400×740 strip (360px of content), so 3 tracks at 10px gutters give
+    // ≈113px cards. A fixed count is the requirement; `auto-fill` would only
+    // resolve to two here. Shared by the real grid and the loading skeleton.
+    "gallery-grid": "grid grid-cols-3 gap-2.5",
     "app-kbd":
       "inline-flex items-center justify-center min-w-7 px-1.5 py-0.5 rounded-[6px] border border-neutral-300 border-b-2 border-b-neutral-400 bg-gradient-to-b from-white to-neutral-100 font-mono text-mini font-500 color-base leading-none shadow-[0_1px_2px_rgba(0,0,0,0.04)] dark:border-neutral-700 dark:border-b-neutral-600 dark:from-neutral-700 dark:to-neutral-800 dark:color-neutral-200",
 

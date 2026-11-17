@@ -721,6 +721,33 @@ pub fn delete_gallery_item(path: String) -> std::result::Result<(), String> {
     crate::gallery::delete(&settings, &path).map_err(|e| format!("{e:#}"))
 }
 
+/// Delete many screenshots in one IPC call from the gallery's select mode.
+///
+/// Returns the candidates that could not be deleted, each paired with the
+/// reason, so a partly-failed batch can still be reported honestly instead of
+/// looking like a total failure. A batch never aborts the whole command: the
+/// frontend removes exactly the paths it did not get back.
+///
+/// `spawn_blocking` for the same reason as listing — a large batch means many
+/// `remove_file` calls plus cache lookups, and the UI must stay responsive.
+#[tauri::command]
+pub async fn delete_gallery_items(
+    paths: Vec<String>,
+) -> std::result::Result<Vec<crate::types::DeleteFailure>, String> {
+    tokio::task::spawn_blocking(move || {
+        let settings = settings::load_settings();
+        crate::gallery::delete_many(&settings, &paths).map(|failures| {
+            failures
+                .into_iter()
+                .map(|(path, reason)| crate::types::DeleteFailure { path, reason })
+                .collect()
+        })
+    })
+    .await
+    .map_err(|e| format!("delete task failed: {e}"))?
+    .map_err(|e| format!("{e:#}"))
+}
+
 /// Resolved save directory, so the UI can show where files actually go.
 #[tauri::command]
 pub fn save_directory() -> std::result::Result<String, String> {

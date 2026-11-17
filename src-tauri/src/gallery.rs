@@ -259,6 +259,40 @@ pub fn delete(settings: &Settings, candidate: &str) -> Result<()> {
     delete_in(&cache_root, settings, candidate)
 }
 
+/// Delete several screenshots in one pass, reporting `(candidate, reason)` for
+/// every file that could not be removed.
+///
+/// Batched deletion is deliberately *not* transactional: the gallery is a plain
+/// directory, so a half-applied batch is still a valid state, and refusing to
+/// delete the 9 good files because the 10th vanished under us would be worse
+/// than the partial result. Each candidate goes through [`delete_in`], which
+/// keeps the same save-directory containment check as the single-file path —
+/// a stale or hostile path in the batch can only fail, never escape the folder.
+///
+/// The candidate strings (not resolved paths) come back on failure so the UI can
+/// match them against its list without re-deriving how a path was resolved.
+pub fn delete_many(settings: &Settings, candidates: &[String]) -> Result<Vec<(String, String)>> {
+    let cache_root = default_thumb_dir()?;
+    delete_many_in(&cache_root, settings, candidates)
+}
+
+/// Testable core of [`delete_many`], with the cache root injected.
+pub fn delete_many_in(
+    cache_root: &Path,
+    settings: &Settings,
+    candidates: &[String],
+) -> Result<Vec<(String, String)>> {
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        if let Err(e) = delete_in(cache_root, settings, candidate) {
+            // `{e:#}` keeps the anyhow context chain, which is what the toast
+            // shows; a bare Display would drop the OS-level reason.
+            failures.push((candidate.clone(), format!("{e:#}")));
+        }
+    }
+    Ok(failures)
+}
+
 /// Testable core of [`delete`], with the cache root injected.
 pub fn delete_in(cache_root: &Path, settings: &Settings, candidate: &str) -> Result<()> {
     let dir = crate::settings::save_dir_path(settings)?;
@@ -387,6 +421,52 @@ mod tests {
 
         // Deleting again reports the missing file rather than panicking.
         assert!(delete_in(&cache, &settings, name).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&cache).ok();
+    }
+
+    #[test]
+    fn delete_many_removes_good_files_and_reports_the_rest() {
+        let dir = temp_dir("delete-many");
+        let cache = temp_dir("delete-many-cache");
+        let kept = "shutter-20260101-000000.png";
+        let gone = "shutter-20260101-000001.png";
+        write_png(&dir.join(kept), 4, 4);
+        write_png(&dir.join(gone), 4, 4);
+
+        let mut settings = Settings::default();
+        settings.save_dir = Some(dir.display().to_string());
+
+        // Warm both cache entries so we can assert they are cleaned up.
+        for name in [kept, gone] {
+            thumbnail_in(&cache, &settings, name).unwrap();
+        }
+        let kept_cache = thumb_path(&cache, &dir.join(kept)).unwrap();
+        let gone_cache = thumb_path(&cache, &dir.join(gone)).unwrap();
+        assert!(kept_cache.exists() && gone_cache.exists());
+
+        let missing = "shutter-20260101-000002.png";
+        let outside = "../shutter-20260101-000000.png".to_string();
+        let batch = vec![
+            kept.to_string(),
+            gone.to_string(),
+            missing.to_string(),
+            outside,
+        ];
+        let failures = delete_many_in(&cache, &settings, &batch).unwrap();
+
+        // The two real files are gone, along with their thumbnails.
+        assert!(!dir.join(kept).exists());
+        assert!(!dir.join(gone).exists());
+        assert!(!kept_cache.exists() && !gone_cache.exists());
+
+        // Only the bad entries are reported, keyed by the candidate text the
+        // caller passed in — not by a re-resolved path.
+        let failed: Vec<&str> = failures.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(failed, vec![missing, "../shutter-20260101-000000.png"]);
+        assert!(failures.iter().all(|(_, reason)| !reason.is_empty()));
+
+        assert!(list(&settings).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&cache).ok();
     }
