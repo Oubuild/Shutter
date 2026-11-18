@@ -98,11 +98,25 @@ pub async fn start_capture(app: &AppHandle) -> Result<CaptureSession> {
     crate::session::Store::prune_frames(&frame_dir, &session.id);
 
     // A boot tool (tray 长截图) applies to this session's overlays only.
+    // One monitor failing to host a window must not cancel the whole capture:
+    // the remaining screens still get a usable overlay.
     let boot = overlay::take_boot_tool();
+    let mut shown = 0usize;
     for info in &monitors {
-        let win = overlay::create(app, info.id, info.x, info.y, info.width, info.height, &boot)?;
-        overlay::reveal(&win)?;
+        match overlay::create(app, info.id, info.x, info.y, info.width, info.height, &boot)
+            .and_then(|win| overlay::reveal(&win, info))
+        {
+            Ok(()) => shown += 1,
+            Err(e) => log::error!("overlay for monitor {} failed: {e:#}", info.id),
+        }
     }
+    if shown == 0 {
+        anyhow::bail!("无法创建截图遮罩窗口");
+    }
+    // AppKit only delivers `mouseMoved` to the key window, so a secondary
+    // display's overlay would never see hover: keep the window under the
+    // cursor focused as the pointer crosses screens.
+    overlay::follow_pointer(app, monitors.clone());
 
     let session_id = session.id.clone();
     app.emit("capture://ready", &session_id)?;
@@ -333,7 +347,7 @@ async fn do_confirm(
         });
     }
 
-    let crop_id = store.put_crop(png);
+    let crop_id = store.put_crop(png, monitor_id);
 
     // Window-opening side effects happen before the teardown: once the
     // overlays are destroyed, the webview waiting on this invoke is gone and
@@ -853,28 +867,47 @@ fn open_pin_for_crop(app: &AppHandle, crop_id: &str) -> Result<()> {
     let store: State<'_, Arc<crate::session::Store>> = app.state();
     let info = store.crop_info(crop_id)?;
 
-    // Match the window to the image, capped so a full-screen crop does not
-    // create a window larger than the desktop.
-    let (sw, sh, s) = app
-        .primary_monitor()
-        .ok()
-        .flatten()
+    // The monitor the crop came from owns the pin: its scale factor converts the
+    // PNG pixels and its logical origin anchors the window, so a secondary-screen
+    // crop lands on that screen and a mixed-DPI desktop scales correctly. Only a
+    // session that has already been replaced falls back to the primary display.
+    let (ox, oy, sw, sh, s) = store
+        .current()
+        .and_then(|session| session.monitor(info.monitor_id).cloned())
         .map(|m| {
-            let s = m.scale_factor();
             (
-                (m.size().width as f64 / s) as f64,
-                (m.size().height as f64 / s) as f64,
-                s,
+                f64::from(m.x),
+                f64::from(m.y),
+                f64::from(m.width),
+                f64::from(m.height),
+                m.scale_factor,
             )
         })
-        .unwrap_or((1440.0, 900.0, 1.0));
+        .or_else(|| {
+            // The main display is where the global display space is anchored, so
+            // its logical origin is the desktop origin; only its size needs the
+            // physical-to-logical division its handle reports in.
+            app.primary_monitor().ok().flatten().map(|m| {
+                let s = m.scale_factor();
+                (
+                    0.0,
+                    0.0,
+                    m.size().width as f64 / s,
+                    m.size().height as f64 / s,
+                    s,
+                )
+            })
+        })
+        .unwrap_or((0.0, 0.0, 1440.0, 900.0, 1.0));
     // `crop_info` dims are PNG pixels (physical); the window is logical, so
     // divide by the scale factor or a Retina pin comes out twice too large.
     let (iw, ih) = (info.width as f64 / s, info.height as f64 / s);
     let fit = (sw * 0.8 / iw).min(sh * 0.8 / ih).min(1.0);
+    // Centred inside the source monitor's own frame; a negative origin is a
+    // normal position for a display placed left of, or above, the primary one.
     let rect = Rect {
-        x: ((sw - iw * fit) / 2.0).max(0.0),
-        y: ((sh - ih * fit) / 2.0).max(0.0),
+        x: ox + (sw - iw * fit) / 2.0,
+        y: oy + (sh - ih * fit) / 2.0,
         width: iw * fit,
         height: ih * fit,
     };
