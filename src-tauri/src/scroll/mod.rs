@@ -96,7 +96,7 @@ fn preview_path(_app: &AppHandle) -> Result<std::path::PathBuf> {
 /// selection" test was permanently false and the armed scroller never started,
 /// no matter where the mouse actually was.
 #[cfg(target_os = "macos")]
-fn mouse_location() -> (f64, f64) {
+pub(crate) fn mouse_location() -> (f64, f64) {
     use core_graphics::geometry::CGPoint;
 
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -467,6 +467,8 @@ fn open_control_bar(app: &AppHandle, monitor: &crate::types::MonitorInfo) -> Res
     }
     let w = 330.0;
     let h = 52.0;
+    // Global logical coordinates: a display placed left of, or above, the primary
+    // one has a negative origin, so the computed position is used verbatim.
     let x = monitor.x as f64 + (monitor.width as f64 - w) / 2.0;
     let y = monitor.y as f64 + (monitor.height as f64 - h - 48.0).max(24.0);
 
@@ -476,8 +478,8 @@ fn open_control_bar(app: &AppHandle, monitor: &crate::types::MonitorInfo) -> Res
         label,
         "index.html?view=scrollbar",
         "Shutter 长截图",
-        x.max(0.0),
-        y.max(0.0),
+        x,
+        y,
         w,
         h,
         false,

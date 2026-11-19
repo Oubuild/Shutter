@@ -41,9 +41,11 @@ pub fn displays() -> Result<Vec<Display>> {
         }
         let info = MonitorInfo {
             id: monitor.id().unwrap_or(0),
+            // `friendly_name()` reaches for `NSScreen`, which AppKit only allows on
+            // the main thread, while this runs on a `spawn_blocking` worker;
+            // `name()` is pure CoreGraphics and safe from any thread.
             name: monitor
-                .friendly_name()
-                .or_else(|_| monitor.name())
+                .name()
                 .unwrap_or_else(|_| format!("Display {}", out.len() + 1)),
             x: monitor.x().unwrap_or(0),
             y: monitor.y().unwrap_or(0),

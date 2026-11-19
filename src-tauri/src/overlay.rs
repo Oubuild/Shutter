@@ -78,8 +78,12 @@ pub fn create(
 }
 
 /// Bring an overlay to the front and confirm it landed on screen.
-pub fn reveal(win: &WebviewWindow) -> Result<()> {
+///
+/// `monitor` is the display the window was built for: its logical origin is the
+/// only trustworthy frame reference available here.
+pub fn reveal(win: &WebviewWindow, monitor: &crate::types::MonitorInfo) -> Result<()> {
     let label = win.label().to_string();
+    let (mx, my) = (f64::from(monitor.x), f64::from(monitor.y));
     win.set_always_on_top(true)
         .map_err(|e| anyhow::anyhow!("always-on-top {label}: {e}"))?;
     // set_always_on_top resets the level to floating (below the Dock);
@@ -113,16 +117,31 @@ pub fn reveal(win: &WebviewWindow) -> Result<()> {
             win.show().ok();
             // Nudge the frame: some macOS versions ignore the first show of a
             // window created with a non-standard level.
-            let pos = win.outer_position().unwrap_or_default();
-            let _ = win.set_position(tauri::LogicalPosition::new(pos.x, pos.y + 1));
-            let _ = win.set_position(tauri::LogicalPosition::new(pos.x, pos.y));
+            //
+            // The nudge is written in logical points, so its reference is the
+            // monitor's logical origin rather than a readback of the live frame:
+            // `outer_position()` reports physical pixels while
+            // `set_position(LogicalPosition)` is consumed as Cocoa points, so on
+            // a scaled display whose origin is not the desktop origin, a
+            // readback-then-write lands the window at double that origin — off
+            // the desktop entirely.
+            let _ = win.set_position(tauri::LogicalPosition::new(mx, my + 1.0));
+            let _ = win.set_position(tauri::LogicalPosition::new(mx, my));
         }
     }
+    // Expected values are the monitor's logical frame; the measured pair is in
+    // physical pixels. They differ by exactly `scale_factor` unless the window
+    // server has clamped or re-parented the window.
     let size = win.inner_size().map(|s| (s.width, s.height)).unwrap_or((0, 0));
     let pos = win.outer_position().map(|p| (p.x, p.y)).unwrap_or((0, 0));
     log::info!(
-        "overlay {label} revealed: visible={:?} size={size:?} pos={pos:?}",
-        win.is_visible()
+        "overlay {label} revealed: visible={:?} expected_logical_origin=({mx}, {my}) \
+         expected_logical_size=({}x{}) actual_physical_pos={pos:?} actual_physical_size={size:?} \
+         scale_factor={}",
+        win.is_visible(),
+        monitor.width,
+        monitor.height,
+        win.scale_factor().unwrap_or(0.0),
     );
     Ok(())
 }
@@ -138,3 +157,58 @@ pub fn destroy_all(app: &AppHandle) {
         }
     }
 }
+
+/// Hand key-window status to the overlay the pointer is on.
+///
+/// macOS delivers `mouseMoved` to the key window only, so an overlay that is
+/// not key sees no pointer movement at all — window snapping, the loupe and
+/// the eyedropper then track the cursor on one display only. A click still
+/// works anywhere, because the mouse-down makes its own window key first. With
+/// one overlay per display, exactly one display can ever be key, so the key
+/// window has to follow the pointer.
+///
+/// The pointer is read from the hardware event source (the same call the
+/// auto-scroller uses) and only the display *change* triggers a focus call, so
+/// movement inside a display — including a selection drag — leaves the window
+/// stack alone.
+#[cfg(target_os = "macos")]
+pub fn follow_pointer(app: &AppHandle, monitors: Vec<crate::types::MonitorInfo>) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let mut over: Option<u32> = None;
+        // The overlays are the session: once confirm/cancel has closed them
+        // there is nothing left to track. The bound is a safety net for a
+        // session that ends without the windows ever being observed closed.
+        for _ in 0..10_000 {
+            let windows = app.webview_windows();
+            if !windows.keys().any(|label| label.starts_with("overlay-")) {
+                break;
+            }
+            let (px, py) = crate::scroll::mouse_location();
+            if px.is_finite() && py.is_finite() {
+                let hit = monitors.iter().find(|m| {
+                    px >= f64::from(m.x)
+                        && px < f64::from(m.x) + f64::from(m.width)
+                        && py >= f64::from(m.y)
+                        && py < f64::from(m.y) + f64::from(m.height)
+                });
+                let hit = hit.map(|m| m.id);
+                if hit != over {
+                    over = hit;
+                    if let Some(id) = hit {
+                        let label = label_for(id);
+                        if let Some(win) = windows.get(&label) {
+                            log::info!("pointer moved to monitor {id}: focusing {label}");
+                            let _ = win.set_focus();
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+    });
+}
+
+/// No other platform restricts pointer-move delivery to the key window.
+#[cfg(not(target_os = "macos"))]
+pub fn follow_pointer(_app: &AppHandle, _monitors: Vec<crate::types::MonitorInfo>) {}

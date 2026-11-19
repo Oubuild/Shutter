@@ -186,6 +186,7 @@ export function Overlay({ monitorId }: Props) {
   /** Load the monitor descriptor + frozen frame for this window. */
   useEffect(() => {
     let cancelled = false;
+    let failTimer: number | undefined;
     (async () => {
       try {
         await import("@tauri-apps/api/core")
@@ -196,10 +197,22 @@ export function Overlay({ monitorId }: Props) {
         // a second time (a second capture would include this very overlay).
         const session = await api.currentSession();
         if (!session) throw new Error("截图会话已结束，请重新截图");
-        const info = session.monitors.find((m) => m.id === monitorId) ?? session.monitors[0];
-        if (!info) throw new Error("没有可用的显示器");
+        // A window may only draw the monitor it was created for. Falling back
+        // to another monitor would show a foreign frame at foreign size and
+        // turn a window-placement bug into a silent wrong-crop, so an id
+        // mismatch is fatal here.
+        const info = session.monitors.find((m) => m.id === monitorId);
+        if (!info) throw new Error(`显示器 ${monitorId} 不可用，请重新截图`);
         setMonitor(info);
         setSessionId(session.sessionId);
+        // The descriptor and the webview must agree on size: a mismatch means
+        // the OS gave this window different bounds than its monitor, which is
+        // otherwise only visible as a misaligned overlay.
+        void reportDebug("overlay-viewport", {
+          monitorId: info.id,
+          monitor: `${info.width}x${info.height}`,
+          viewport: `${window.innerWidth}x${window.innerHeight}`,
+        });
 
         const path = await api.framePath(info.id, session.sessionId);
         if (cancelled) return;
@@ -263,10 +276,17 @@ export function Overlay({ monitorId }: Props) {
         }
       } catch (e) {
         setToast(errorText(e));
+        // Every failure here leaves this window with no usable frame, so the
+        // whole capture is torn down rather than parking a dead overlay on
+        // screen; the delay lets the toast be read before the windows close.
+        failTimer = window.setTimeout(() => {
+          void api.cancelCapture().catch(() => undefined);
+        }, 1500);
       }
     })();
     return () => {
       cancelled = true;
+      window.clearTimeout(failTimer);
     };
   }, [monitorId]);
 

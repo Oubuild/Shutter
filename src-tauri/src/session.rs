@@ -47,8 +47,8 @@ impl Session {
 pub struct Store {
     /// Only the newest session is kept: the overlay always operates on it.
     current: Mutex<Option<Arc<Session>>>,
-    /// PNG bytes for finished crops, keyed by crop id.
-    crops: Mutex<HashMap<String, Vec<u8>>>,
+    /// PNG bytes plus the monitor the crop came from, keyed by crop id.
+    crops: Mutex<HashMap<String, (Vec<u8>, u32)>>,
 }
 
 /// A crop plus the dimensions the pin window should use.
@@ -56,6 +56,10 @@ pub struct CropInfo {
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Id of the monitor the crop was taken from. A pin is sized and centred in
+    /// that display's own logical frame, which matters when the screens have
+    /// different scale factors or negative origins.
+    pub monitor_id: u32,
 }
 
 impl Store {
@@ -99,9 +103,12 @@ impl Store {
         self.crops.lock().unwrap().clear();
     }
 
-    pub fn put_crop(&self, png: Vec<u8>) -> String {
+    /// Remember a finished crop and the monitor it came from, so a later pin
+    /// can be placed on that display instead of wherever the pointer happens to
+    /// be or the primary screen.
+    pub fn put_crop(&self, png: Vec<u8>, monitor_id: u32) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        self.crops.lock().unwrap().insert(id.clone(), png);
+        self.crops.lock().unwrap().insert(id.clone(), (png, monitor_id));
         id
     }
 
@@ -110,16 +117,22 @@ impl Store {
             .lock()
             .unwrap()
             .get(id)
-            .cloned()
+            .map(|(png, _)| png.clone())
             .ok_or_else(|| anyhow!("crop {id} not found; take a new screenshot"))
     }
 
     /// Crop bytes plus pixel size, so window chrome can match the image.
     pub fn crop_info(&self, id: &str) -> Result<CropInfo> {
-        let png = self.crop(id)?;
+        let (png, monitor_id) = self
+            .crops
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("crop {id} not found; take a new screenshot"))?;
         let decoded = image::load_from_memory(&png).map_err(|e| anyhow!("decode crop: {e}"))?;
         let (width, height) = (decoded.width(), decoded.height());
-        Ok(CropInfo { png, width, height })
+        Ok(CropInfo { png, width, height, monitor_id })
     }
 }
 
