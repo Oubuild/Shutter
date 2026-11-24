@@ -29,6 +29,18 @@ const STICKY_MIN_ROWS: u32 = 24;
 /// through `nth_back(1/2)` → at least 3).
 const RING_LEN: usize = 3;
 
+/// Consecutive accepted frames required before a column is treated as fixed.
+const FIXED_COLUMN_STREAK: u8 = 3;
+
+/// Sample interval used to compare columns without scanning every pixel.
+const FIXED_COLUMN_SAMPLE_STEP: u32 = 4;
+
+/// Minimum horizontal span treated as one fixed region.
+const FIXED_REGION_MIN_WIDTH: usize = 16;
+
+/// Maximum fraction of changed samples for a column to count as fixed.
+const FIXED_COLUMN_MAX_CHANGE: f64 = 0.01;
+
 /// The growing stitched image plus everything needed to append safely.
 pub struct Stitcher {
     /// The accumulated image (width = selection width, grows downward).
@@ -57,6 +69,10 @@ pub struct Stitcher {
     ring: VecDeque<RgbaImage>,
     /// Diagnostics counter.
     appended: u32,
+    /// Consecutive frames in which each x column stayed visually fixed.
+    fixed_column_streaks: Vec<u8>,
+    /// Columns confirmed as fixed across the viewport.
+    fixed_columns: Vec<bool>,
 }
 
 fn row_hash(img: &RgbaImage, y: u32) -> u64 {
@@ -76,6 +92,7 @@ impl Stitcher {
     /// First frame becomes the base of the accumulated image.
     pub fn new(first: RgbaImage) -> Self {
         let base_height = first.height();
+        let width = first.width() as usize;
         let mut ring = VecDeque::with_capacity(RING_LEN);
         ring.push_back(first.clone());
         Self {
@@ -91,6 +108,8 @@ impl Stitcher {
             bottom_stripped: false,
             ring,
             appended: 1,
+            fixed_column_streaks: vec![0; width],
+            fixed_columns: vec![false; width],
         }
     }
 
@@ -226,6 +245,62 @@ impl Stitcher {
         log::info!("[长截图] 去除基帧固定底栏 {}px", self.sticky_bottom);
     }
 
+    fn update_fixed_columns(&mut self, frame: &RgbaImage) {
+        if frame.dimensions() != self.last_frame.dimensions() {
+            return;
+        }
+        let (width, height) = frame.dimensions();
+        let samples = height.div_ceil(FIXED_COLUMN_SAMPLE_STEP).max(1);
+        for x in 0..width {
+            let mut changed = 0u32;
+            for y in (0..height).step_by(FIXED_COLUMN_SAMPLE_STEP as usize) {
+                let a = self.last_frame.get_pixel(x, y).0;
+                let b = frame.get_pixel(x, y).0;
+                if (0..3).any(|channel| a[channel].abs_diff(b[channel]) > 3) {
+                    changed += 1;
+                }
+            }
+            let index = x as usize;
+            if changed as f64 / samples as f64 <= FIXED_COLUMN_MAX_CHANGE {
+                self.fixed_column_streaks[index] =
+                    self.fixed_column_streaks[index].saturating_add(1);
+                if self.fixed_column_streaks[index] >= FIXED_COLUMN_STREAK {
+                    self.fixed_columns[index] = true;
+                }
+            } else {
+                self.fixed_column_streaks[index] = 0;
+            }
+        }
+        let mut x = 0;
+        while x < self.fixed_columns.len() {
+            if !self.fixed_columns[x] {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            while x < self.fixed_columns.len() && self.fixed_columns[x] {
+                x += 1;
+            }
+            if x - start < FIXED_REGION_MIN_WIDTH {
+                self.fixed_columns[start..x].fill(false);
+            }
+        }
+    }
+
+    fn clear_fixed_columns(&mut self, y_start: u32) {
+        if !self.fixed_columns.iter().any(|fixed| *fixed) {
+            return;
+        }
+        let y_end = self.image.height();
+        for (x, fixed) in self.fixed_columns.iter().enumerate() {
+            if *fixed {
+                for y in y_start..y_end {
+                    self.image.put_pixel(x as u32, y, image::Rgba([0, 0, 0, 0]));
+                }
+            }
+        }
+    }
+
     /// Append a frame at the estimated offset. Returns the rows actually added.
     ///
     /// Geometry (same as the pipeline's): the frame's content above the fixed
@@ -240,6 +315,7 @@ impl Stitcher {
         };
         self.update_sticky_top(&frame);
         self.update_sticky_bottom(&frame);
+        self.update_fixed_columns(&frame);
         self.strip_base_footer();
 
         let fh = frame.height() as i64;
@@ -260,6 +336,7 @@ impl Stitcher {
         imageops::overlay(&mut grown, &self.image, 0, 0);
         imageops::overlay(&mut grown, &new_part, 0, self.image.height() as i64);
         self.image = grown;
+        self.clear_fixed_columns(self.base_height);
         self.history.push(offset);
         self.appended += 1;
         self.last_frame = frame.clone();
@@ -359,6 +436,36 @@ mod tests {
 
     fn window_of(src: &RgbaImage, y: u32, h: u32) -> RgbaImage {
         imageops::crop_imm(src, 0, y, src.width(), h).to_image()
+    }
+
+    fn fixed_sidebar_frame(seed: u8) -> RgbaImage {
+        let mut frame = RgbaImage::new(100, 100);
+        for y in 0..100 {
+            for x in 0..100 {
+                let value = if x < 32 {
+                    ((x * 13 + y * 7) % 256) as u8
+                } else {
+                    seed.wrapping_mul(40).wrapping_add((x * 3 + y * 5) as u8)
+                };
+                frame.put_pixel(x, y, image::Rgba([value, value, value, 255]));
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn fixed_sidebar_is_not_repeated_below_the_first_viewport() {
+        let mut stitcher = Stitcher::new(fixed_sidebar_frame(1));
+        let decision = FrameDecision::Append {
+            offset: 10,
+            confidence: 1.0,
+        };
+        for seed in [2, 3, 4] {
+            stitcher.append(fixed_sidebar_frame(seed), &decision, 10);
+        }
+        assert_eq!(stitcher.image.get_pixel(16, 99).0[3], 255);
+        assert_eq!(stitcher.image.get_pixel(16, 100).0[3], 0);
+        assert_eq!(stitcher.image.get_pixel(80, 100).0[3], 255);
     }
 
     #[test]
