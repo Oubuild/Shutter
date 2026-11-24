@@ -505,14 +505,11 @@ fn row_ssim(a: &[f64], b: &[f64]) -> f64 {
 /// The verifier's measurements over the aligned overlap (reference
 /// `verify::overlap_mae / overlap_ssim / overlap_edge_ncc / row`).
 ///
-/// Every gate value is the *effective* score: the better of the two region
-/// families (row bands, column tiles), each already reduced by median. A
-/// local disturbance poisons at most one family's majority, so the aligned
-/// majority of the other family carries the frame; a wrong offset poisons
-/// both. `band_mae` / `tile_mae` keep the two medians for the diag log.
+/// Both region families (row bands and column tiles) must agree, each reduced
+/// by median. `band_mae` / `tile_mae` keep the two medians for the diag log.
 #[derive(Debug, Clone, Copy)]
 pub struct VerifyReport {
-    /// Effective gate MAE = min(band median, tile median).
+    /// Gate MAE = max(band median, tile median).
     pub mae: f64,
     /// Median MAE across the row bands.
     pub band_mae: f64,
@@ -531,7 +528,8 @@ pub struct VerifyReport {
 impl VerifyReport {
     pub fn ok(&self) -> bool {
         self.samples > 0
-            && self.mae <= MAX_MAE
+            && self.band_mae <= MAX_MAE
+            && self.tile_mae <= MAX_MAE
             && self.edge_ncc >= MIN_EDGE_NCC
             && self.row_score >= MIN_ROW_INTEGRITY
             && self.ssim >= MIN_SSIM
@@ -856,9 +854,8 @@ pub fn verify_alignment(prev: &RgbaImage, next: &RgbaImage, offset: i64) -> Veri
 
     let band = family_medians(&band_scores);
     let tile = family_medians(&tile_scores);
-    // Effective gate values: the better family carries the frame (MAE is a
-    // cost → min; the similarities → max). A family with no scored regions
-    // defers to the other; both empty cannot happen (samples > 0 above).
+    // Both region families must agree; the better family cannot hide a
+    // separately scrolling pane that would otherwise be stitched incorrectly.
     let (band_mae, tile_mae) = match (band, tile) {
         (Some(b), Some(t)) => (b.0, t.0),
         (Some(b), None) => (b.0, 255.0),
@@ -866,7 +863,7 @@ pub fn verify_alignment(prev: &RgbaImage, next: &RgbaImage, offset: i64) -> Veri
         (None, None) => (255.0, 255.0),
     };
     let mae = match (band, tile) {
-        (Some(b), Some(t)) => b.0.min(t.0),
+        (Some(b), Some(t)) => b.0.max(t.0),
         (Some(b), None) => b.0,
         (None, Some(t)) => t.0,
         (None, None) => 255.0,
@@ -876,9 +873,9 @@ pub fn verify_alignment(prev: &RgbaImage, next: &RgbaImage, offset: i64) -> Veri
         match (get(band, bidx), get(tile, tidx)) {
             (Some(bv), Some(tv)) => {
                 if better_max {
-                    bv.max(tv)
-                } else {
                     bv.min(tv)
+                } else {
+                    bv.max(tv)
                 }
             }
             (bv, tv) => bv.or(tv).unwrap_or(1.0),
@@ -1657,14 +1654,10 @@ mod tests {
         }
     }
 
-    /// The reference's 横向分区 case: a TALL-NARROW block (lazy-loaded image,
-    /// video, chat bubble — ~1/3 of the width at real chat proportions) spans
-    /// most of the overlap height. Every row band is poisoned, so the
-    /// row-band family alone would reject — the column-tile family carries
-    /// the frame, exactly what 小旺's 12-strip partition tolerates. Blocks
-    /// covering a MAJORITY of both families are still rejected (see below).
+    /// A tall narrow disturbance indicates a pane may be scrolling or
+    /// repainting independently; reject instead of duplicating its fragments.
     #[test]
-    fn tall_narrow_change_passes_via_column_tiles() {
+    fn tall_narrow_change_is_rejected_by_column_tiles() {
         // `textured` (per-pixel noise on every column) rather than `page`:
         // the sparse-noise `page` generator is affine-periodic mod 256, which
         // hand-crafts a SECOND perfect alignment 266px away — an adversarial
@@ -1678,15 +1671,12 @@ mod tests {
                 b.put_pixel(x, y, image::Rgba([30, 160, 90, 255]));
             }
         }
-        // Direct verifier evidence: bands poisoned, tiles clean, accepted.
+        // Direct verifier evidence: row bands and column tiles disagree.
         let r = verify_alignment(&a, &b, 80);
-        assert!(r.ok(), "{r:?}");
+        assert!(!r.ok(), "{r:?}");
         assert!(r.band_mae > MAX_MAE, "bands should be poisoned: {r:?}");
         assert!(r.tile_mae <= MAX_MAE, "tiles should be clean: {r:?}");
-        match decide(&a, &b, 12) {
-            FrameDecision::Append { offset, .. } => assert_eq!(offset, 80),
-            other => panic!("expected Append, got {other:?}"),
-        }
+        assert!(!matches!(decide(&a, &b, 12), FrameDecision::Append { .. }));
     }
 
     /// A disturbance covering the majority of BOTH families (a full-screen
